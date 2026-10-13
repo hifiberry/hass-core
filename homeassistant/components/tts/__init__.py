@@ -308,6 +308,58 @@ def async_get_text_to_speech_languages(hass: HomeAssistant) -> set[str]:
     return languages
 
 
+async def _async_read_audio_start(
+    audio_input: AsyncGenerator[bytes], size: int
+) -> bytes:
+    """Read at least size bytes from an audio stream, unless it ends earlier."""
+    start = b""
+    async for chunk in audio_input:
+        start += chunk
+        if len(start) >= size:
+            break
+    return start
+
+
+async def _async_prepend_audio(
+    start: bytes, audio_input: AsyncGenerator[bytes]
+) -> AsyncGenerator[bytes]:
+    """Yield the start that was already read, then the rest of the stream."""
+    if start:
+        yield start
+    async for chunk in audio_input:
+        yield chunk
+
+
+def _wav_header_matches(
+    header: bytes,
+    sample_rate: int | None,
+    sample_channels: int | None,
+    sample_bytes: int | None,
+) -> bool:
+    """Return if WAV audio starts with a PCM header in the given format."""
+
+    def header_int(start: int, end: int) -> int:
+        return int.from_bytes(header[start:end], "little")
+
+    return (
+        len(header) >= 44
+        and header[0:4] == b"RIFF"
+        and header[8:16] == b"WAVEfmt "
+        and header_int(16, 20) == 16  # plain PCM format chunk
+        and header_int(20, 22) == 1  # PCM
+        and sample_channels in (None, header_int(22, 24))
+        and sample_rate in (None, header_int(24, 28))
+        and sample_bytes in (None, header_int(34, 36) // 8)
+        and header[36:40] == b"data"
+    )
+
+
+def _wav_header_with_unknown_sizes(start: bytes) -> bytes:
+    """Set the sizes in a WAV header to unknown, as ffmpeg does for a stream."""
+    unknown_size = b"\xff\xff\xff\xff"
+    return start[:4] + unknown_size + start[8:40] + unknown_size + start[44:]
+
+
 async def _async_convert_audio(
     hass: HomeAssistant,
     from_extension: str | None,
@@ -1157,6 +1209,17 @@ class SpeechManager:
             or (sample_bytes is not None)
             or (bitrate is not None)
         )
+
+        if needs_conversion and extension == final_extension == "wav":
+            # Engines report the extension, but not the sample rate, channels
+            # or sample width; for WAV, the header has them. Skipping ffmpeg
+            # when they already match avoids a delay at the start of the
+            # audio: its WAV demuxer reads ahead before it outputs anything.
+            start = await _async_read_audio_start(data_gen, 44)
+            if _wav_header_matches(start, sample_rate, sample_channels, sample_bytes):
+                needs_conversion = False
+                start = _wav_header_with_unknown_sizes(start)
+            data_gen = _async_prepend_audio(start, data_gen)
 
         if needs_conversion:
             data_gen = _async_convert_audio(

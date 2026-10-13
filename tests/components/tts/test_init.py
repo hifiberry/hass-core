@@ -2389,6 +2389,190 @@ async def test_stream_override_with_conversion(
         )  # 1 second @ 22.5Khz/stereo
 
 
+def _wav_header(
+    sample_rate: int = 16000,
+    channels: int = 1,
+    sample_bytes: int = 2,
+    audio_format: int = 1,
+) -> bytes:
+    """Return the 44 byte header of a streamed WAV, which has no sizes yet."""
+
+    def le(value: int, size: int) -> bytes:
+        return value.to_bytes(size, "little")
+
+    return b"".join(
+        [
+            b"RIFF",
+            le(0, 4),
+            b"WAVEfmt ",
+            le(16, 4),
+            le(audio_format, 2),
+            le(channels, 2),
+            le(sample_rate, 4),
+            le(sample_rate * channels * sample_bytes, 4),
+            le(channels * sample_bytes, 2),
+            le(8 * sample_bytes, 2),
+            b"data",
+            le(0, 4),
+        ]
+    )
+
+
+WAV_OPTIONS = {
+    tts.ATTR_PREFERRED_FORMAT: "wav",
+    tts.ATTR_PREFERRED_SAMPLE_RATE: 16000,
+    tts.ATTR_PREFERRED_SAMPLE_CHANNELS: 1,
+    tts.ATTR_PREFERRED_SAMPLE_BYTES: 2,
+}
+
+
+async def test_stream_wav_passthrough(
+    hass: HomeAssistant, mock_tts_entity: MockTTSEntity
+) -> None:
+    """Test streamed WAV that already has the preferred format skips ffmpeg."""
+    await mock_config_entry_setup(hass, mock_tts_entity)
+    more_audio = asyncio.Event()
+
+    async def async_stream_tts_audio(
+        request: tts.TTSAudioRequest,
+    ) -> tts.TTSAudioResponse:
+        """Stream a WAV header split over two chunks, then audio in two parts."""
+
+        async def gen_data():
+            async for _msg in request.message_gen:
+                pass
+            yield _wav_header()[:20]
+            yield _wav_header()[20:] + b"\x01\x00" * 100
+            await more_audio.wait()
+            yield b"\x02\x00" * 100
+
+        return tts.TTSAudioResponse(extension="wav", data_gen=gen_data())
+
+    mock_tts_entity.async_stream_tts_audio = async_stream_tts_audio
+    mock_tts_entity.async_supports_streaming_input = Mock(return_value=True)
+
+    stream = tts.async_create_stream(
+        hass, mock_tts_entity.entity_id, options=WAV_OPTIONS
+    )
+    mock_process = MagicMock()
+    mock_process.stdin.drain = AsyncMock()
+    mock_process.stdout.read = AsyncMock(return_value=b"")
+    mock_process.wait = AsyncMock(return_value=0)
+
+    with patch(
+        "asyncio.create_subprocess_exec", return_value=mock_process
+    ) as mock_create_subprocess_exec:
+        stream.async_set_message("hello")
+        result = stream.async_stream_result()
+        result_data = b""
+        try:
+            # The audio streamed so far arrives before the TTS stream ends.
+            async with asyncio.timeout(1):
+                while len(result_data) < 44 + 200:
+                    result_data += await anext(result)
+        finally:
+            more_audio.set()
+        result_data += b"".join([chunk async for chunk in result])
+
+    mock_create_subprocess_exec.assert_not_called()
+    # The header is the one ffmpeg writes for a stream: sizes not known yet.
+    unknown_size = b"\xff\xff\xff\xff"
+    header = _wav_header()
+    assert result_data == (
+        header[:4]
+        + unknown_size
+        + header[8:40]
+        + unknown_size
+        + b"\x01\x00" * 100
+        + b"\x02\x00" * 100
+    )
+
+
+@pytest.mark.parametrize(
+    ("header", "options", "matches"),
+    [
+        pytest.param(_wav_header(), (16000, 1, 2), True, id="same_format"),
+        pytest.param(_wav_header(), (None, None, None), True, id="no_preference"),
+        pytest.param(_wav_header(), (16000, None, None), True, id="rate_only"),
+        pytest.param(_wav_header(sample_rate=22050), (16000, 1, 2), False, id="rate"),
+        pytest.param(_wav_header(channels=2), (16000, 1, 2), False, id="channels"),
+        pytest.param(
+            _wav_header(sample_bytes=4), (16000, 1, 2), False, id="sample_bytes"
+        ),
+        pytest.param(_wav_header(audio_format=3), (16000, 1, 2), False, id="float"),
+        pytest.param(
+            _wav_header()[:16] + (18).to_bytes(4, "little") + _wav_header()[20:],
+            (16000, 1, 2),
+            False,
+            id="extended_format_chunk",
+        ),
+        pytest.param(
+            _wav_header()[:36] + b"LIST" + _wav_header()[40:],
+            (16000, 1, 2),
+            False,
+            id="data_not_next",
+        ),
+        pytest.param(b"ID3" + _wav_header()[3:], (16000, 1, 2), False, id="not_wav"),
+        pytest.param(_wav_header()[:30], (16000, 1, 2), False, id="short"),
+    ],
+)
+def test_wav_header_matches(
+    header: bytes, options: tuple[int | None, int | None, int | None], matches: bool
+) -> None:
+    """Test which WAV headers already have the preferred format."""
+    assert tts._wav_header_matches(header, *options) is matches
+
+
+@pytest.mark.parametrize(
+    "wav_data",
+    [
+        pytest.param(_wav_header(sample_rate=22050), id="other_format"),
+        pytest.param(_wav_header()[:30], id="short_stream"),
+    ],
+)
+async def test_stream_wav_conversion_needed(
+    hass: HomeAssistant, mock_tts_entity: MockTTSEntity, wav_data: bytes
+) -> None:
+    """Test streamed WAV in another format still goes through ffmpeg."""
+    await mock_config_entry_setup(hass, mock_tts_entity)
+
+    async def async_stream_tts_audio(
+        request: tts.TTSAudioRequest,
+    ) -> tts.TTSAudioResponse:
+        """Stream the WAV in two chunks."""
+
+        async def gen_data():
+            async for _msg in request.message_gen:
+                pass
+            yield wav_data[:20]
+            yield wav_data[20:]
+
+        return tts.TTSAudioResponse(extension="wav", data_gen=gen_data())
+
+    mock_tts_entity.async_stream_tts_audio = async_stream_tts_audio
+    mock_tts_entity.async_supports_streaming_input = Mock(return_value=True)
+
+    stream = tts.async_create_stream(
+        hass, mock_tts_entity.entity_id, options=WAV_OPTIONS
+    )
+    mock_process = MagicMock()
+    mock_process.stdin.drain = AsyncMock()
+    mock_process.stdout.read = AsyncMock(side_effect=[b"converted", b""])
+    mock_process.wait = AsyncMock(return_value=0)
+
+    with patch(
+        "asyncio.create_subprocess_exec", return_value=mock_process
+    ) as mock_create_subprocess_exec:
+        stream.async_set_message("hello")
+        result_data = b"".join([chunk async for chunk in stream.async_stream_result()])
+
+    mock_create_subprocess_exec.assert_called_once()
+    assert result_data == b"converted"
+    # ffmpeg gets all of the audio, including the header that was inspected.
+    written = b"".join(call.args[0] for call in mock_process.stdin.write.call_args_list)
+    assert written == wav_data
+
+
 def test_write_tags_keeps_single_id3_tag() -> None:
     """Test tagging audio that already carries an ID3 tag does not add a second one."""
     data = load_fixture_bytes("tagged.mp3", DOMAIN)
